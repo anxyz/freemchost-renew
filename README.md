@@ -8,7 +8,7 @@
 |---|---|---|---|
 | `FREE_EMAIL`         | ✅必填 | Freemhost 邮箱 |
 | `FREE_PASSWORD`      | ✅必填 | Freemhost 密码 |
-| `SERVER_PAGE_URL`    | ✅必填 | VPS地址,(https://new.freemchost.com/server/xxxxxx),多个可用,或换行间隔|
+| `SERVER_PAGE_URL`    | ✅必填 | VPS管理地址,多个可用,或换行间隔(https://new.freemchost.com/server/xxxxxx)|
 | `TG_BOT_TOKEN`  | ❌可选 | Telegram Bot Token | 
 | `TG_CHAT_ID`    | ❌可选 | Telegram Chat ID |
 
