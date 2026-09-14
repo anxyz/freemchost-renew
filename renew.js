@@ -5,7 +5,7 @@ if (!fs.existsSync('screenshots')) {
   fs.mkdirSync('screenshots');
 }
 
-// Telegram 通知工具（含双重格式降级）
+// Telegram 通知工具（含格式降级）
 async function sendTelegramMessage(botToken, chatId, text) {
   if (!botToken || !chatId) {
     console.log('⚠️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过通知。');
@@ -47,47 +47,46 @@ async function sendTelegramMessage(botToken, chatId, text) {
   }
 }
 
-// 🛡️ 深度清理所有 Maybe later 弹窗及遮罩
+// 🛡️ 强力扫除所有 Maybe later / 营销弹窗
 async function forceDismissPopups(page) {
   await page.keyboard.press('Escape');
 
-  // 1. 关闭 Cookie 协议栏
+  // 1. 关闭 Cookie 栏
   try {
     const cookieBtn = page.locator('button:has-text("Accept all"), button:has-text("Reject all")').first();
-    if (await cookieBtn.isVisible({ timeout: 1000 })) {
+    if (await cookieBtn.isVisible({ timeout: 800 })) {
       await cookieBtn.click();
     }
   } catch (e) {}
 
-  // 2. 优先通过 Locator 点击可见的 "Maybe later" 按钮/链接
-  try {
-    const maybeLaterLoc = page.locator('button, a, span, div').filter({ hasText: /^Maybe later$/i }).first();
-    if (await maybeLaterLoc.isVisible({ timeout: 1000 })) {
-      await maybeLaterLoc.click({ force: true });
-      console.log('🛡️ 已点击 [Maybe later] 关闭弹窗');
-      await page.waitForTimeout(600);
-    }
-  } catch (e) {}
+  // 2. 点击可见的 Maybe later 按钮
+  for (let i = 0; i < 3; i++) {
+    try {
+      const maybeLater = page.locator('button, a, span, div').filter({ hasText: /^Maybe later$/i }).first();
+      if (await maybeLater.isVisible({ timeout: 800 })) {
+        await maybeLater.click({ force: true });
+        console.log('🛡️ 已点击 [Maybe later] 关闭弹窗');
+        await page.waitForTimeout(500);
+      }
+    } catch (e) {}
+  }
 
-  // 3. 深入 DOM 树清除所有残留的营销卡片与关闭按钮 (✕)
+  // 3. 原生 DOM 移除遮罩与关闭按钮
   await page.evaluate(() => {
     const allEls = Array.from(document.querySelectorAll('*'));
     
-    // 点击纯文本包含 maybe later 或 i need help 的元素
     const textTargets = allEls.filter(el => 
       el.children.length === 0 && 
       ['maybe later', 'i need help'].includes(el.textContent.trim().toLowerCase())
     );
     textTargets.forEach(el => el.click());
 
-    // 寻找并点击弹窗右上角的独立关闭图标 (✕)
     const closeBtns = allEls.filter(el => 
       (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') &&
       (el.innerText.trim() === '✕' || el.innerText.trim() === '×' || el.getAttribute('aria-label') === 'Close')
     );
     closeBtns.forEach(btn => btn.click());
 
-    // 彻底移除特定标题模态框的容器节点
     const modalHeaders = allEls.filter(el => 
       el.textContent && (
         el.textContent.includes('Got an idea to make FreeMCHost better') ||
@@ -108,10 +107,10 @@ async function forceDismissPopups(page) {
     });
   });
 
-  await page.waitForTimeout(400);
+  await page.waitForTimeout(300);
 }
 
-// 模拟真实用户输入（防止 SPA 水合清空）
+// 模拟真实用户输入
 async function safeFill(page, locator, value, label) {
   await locator.waitFor({ state: 'visible', timeout: 15000 });
   await locator.click();
@@ -200,29 +199,61 @@ async function safeFill(page, locator, value, label) {
 
       try {
         await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(2500);
+        await page.waitForTimeout(3000);
         await forceDismissPopups(page);
 
-        // 🎯 核心变更：切换至 [Billing] 或 [PLAN Billing] 选项卡
+        // 🎯 定位顶部的 [Billing] / [PLAN Billing] 标签页（避免误选底部隐藏的移动端链接）
         console.log('🗂️ 正在定位并点击 [Billing] / [PLAN Billing] 标签页...');
-        const billingTab = page.locator('button, a, div[role="tab"]').filter({ 
-          hasText: /(Billing|PLAN Billing|Manage)/i 
-        }).last();
         
-        await billingTab.waitFor({ state: 'visible', timeout: 15000 });
-        await billingTab.click();
+        let tabClicked = false;
+        // 策略 1：精准匹配包含 PLAN 与 Billing 的可见按钮
+        const tabCandidates = page.locator('button, a, div[role="tab"]').filter({ 
+          hasText: /Billing/i 
+        });
         
-        console.log('⏳ 等待 Plan & lifecycle 页面面板渲染...');
+        const count = await tabCandidates.count();
+        for (let idx = 0; idx < count; idx++) {
+          const item = tabCandidates.nth(idx);
+          if (await item.isVisible().catch(() => false)) {
+            const txt = await item.innerText().catch(() => '');
+            // 排除掉全站通用跳转的 /app/billing，锁定详情页标签
+            if (!txt.includes('Total') && (txt.includes('Billing') || txt.includes('PLAN'))) {
+              await item.click({ force: true });
+              tabClicked = true;
+              console.log(`👉 已点击可见标签: [${txt.replace(/\n/g, ' ')}]`);
+              break;
+            }
+          }
+        }
+
+        // 策略 2：DOM 穿透兜底
+        if (!tabClicked) {
+          tabClicked = await page.evaluate(() => {
+            const els = Array.from(document.querySelectorAll('button, a, div[role="tab"]'));
+            const target = els.find(el => {
+              const text = el.innerText || '';
+              const isBillingTab = (text.includes('Billing') || text.includes('PLAN')) && !el.getAttribute('href')?.endsWith('/app/billing');
+              const rect = el.getBoundingClientRect();
+              return isBillingTab && rect.width > 0 && rect.height > 0;
+            });
+            if (target) {
+              target.click();
+              return true;
+            }
+            return false;
+          });
+        }
+
         await page.waitForTimeout(2500);
         await forceDismissPopups(page);
 
-        // 确认页面已加载到该区域并等待 Renew now 按钮出现
+        // 等待 Plan & lifecycle 区域渲染并查找 Renew now
         const renewBtn = page.locator('button:has-text("Renew now")').first();
         await renewBtn.waitFor({ state: 'visible', timeout: 15000 });
         await page.waitForTimeout(1000);
         await forceDismissPopups(page);
 
-        // 🎯 从 TIME UNTIL EXPIRY 容器中抓取实际剩余时间
+        // 抓取剩余时间
         const timeData = await page.evaluate(() => {
           const allEls = Array.from(document.querySelectorAll('*'));
           const header = allEls.find(el => el.textContent && el.textContent.trim().toUpperCase() === 'TIME UNTIL EXPIRY');
@@ -251,7 +282,7 @@ async function safeFill(page, locator, value, label) {
         const remainStr = timeData ? timeData.raw : '未读取到';
         console.log(`⏱️ 服务器 [${sIndex}] 实际剩余时长: ${remainStr} (约 ${remainHours.toFixed(1)} 小时)`);
 
-        // 判断是否触发 < 46 小时 免费续期门槛
+        // 判断是否小于 46 小时
         if (remainHours < 46) {
           console.log(`🎯 剩余时长 < 46 小时，执行续期加时...`);
           await renewBtn.click();
@@ -297,6 +328,11 @@ async function safeFill(page, locator, value, label) {
       } catch (innerErr) {
         console.error(`❌ 服务器 [${sIndex}] 处理异常:`, innerErr.message);
         reports.push(`🔴 <b>服务器 ${sIndex}</b>: 巡检失败 (${innerErr.message.substring(0, 30)})`);
+        
+        // 捕获异常现场截图，供 Artifacts 下载核对
+        try {
+          await page.screenshot({ path: `screenshots/error-server-${sIndex}.png`, fullPage: true });
+        } catch (e) {}
       }
     }
 
@@ -306,11 +342,13 @@ async function safeFill(page, locator, value, label) {
 
   } catch (error) {
     console.error('❌ 全局致命错误:', error.message);
-    await page.screenshot({ path: 'screenshots/renew_fatal.png', fullPage: true });
+    try {
+      await page.screenshot({ path: 'screenshots/renew_fatal.png', fullPage: true });
+    } catch (e) {}
     await sendTelegramMessage(tgToken, tgChatId, `🚨 <b>Freemchost 运行崩溃:</b> <code>${error.message}</code>`);
     process.exitCode = 1;
   } finally {
     await browser.close();
-    console.log('🏁 浏览器已关闭，任务结束。');
+    console.log('🏁 任务完成，浏览器已关闭。');
   }
 })();
