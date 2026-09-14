@@ -47,56 +47,49 @@ async function sendTelegramMessage(botToken, chatId, text) {
   }
 }
 
-// 🛡️ 扫除干扰弹窗与营销弹窗
+// 🛡️ 深度清理反馈评分、营销升级弹窗（绝不误关续期弹窗）
 async function forceDismissPopups(page) {
-  await page.keyboard.press('Escape');
-
-  // 关闭 Cookie 栏
+  // 1. 关闭 Cookie 栏
   try {
     const cookieBtn = page.locator('button:has-text("Accept all"), button:has-text("Reject all")').first();
-    if (await cookieBtn.isVisible({ timeout: 800 })) {
+    if (await cookieBtn.isVisible({ timeout: 500 })) {
       await cookieBtn.click();
     }
   } catch (e) {}
 
-  // 点击可见的 Maybe later 按钮
-  for (let i = 0; i < 3; i++) {
-    try {
-      const maybeLater = page.locator('button, a, span, div').filter({ hasText: /^Maybe later$/i }).first();
-      if (await maybeLater.isVisible({ timeout: 800 })) {
-        await maybeLater.click({ force: true });
-        await page.waitForTimeout(500);
-      }
-    } catch (e) {}
-  }
+  // 2. 点击可见的 Maybe later
+  try {
+    const maybeLater = page.locator('button, a, span, div').filter({ hasText: /^Maybe later$/i }).first();
+    if (await maybeLater.isVisible({ timeout: 800 })) {
+      await maybeLater.click({ force: true });
+      console.log('🛡️ 已点击 [Maybe later] 关闭干扰弹窗');
+      await page.waitForTimeout(500);
+    }
+  } catch (e) {}
 
-  // 原生 DOM 移除反馈弹窗与升级弹窗
+  // 3. 原生 DOM 精准移除干扰模态框（打分、反馈、免费升级等）
   await page.evaluate(() => {
     const allEls = Array.from(document.querySelectorAll('*'));
     
-    const textTargets = allEls.filter(el => 
-      el.children.length === 0 && 
-      ['maybe later', 'i need help'].includes(el.textContent.trim().toLowerCase())
-    );
-    textTargets.forEach(el => el.click());
+    const noiseHeaders = allEls.filter(el => {
+      const txt = el.textContent || '';
+      return (
+        txt.includes('How would you rate FreeMCHost') ||
+        txt.includes('Your feedback') ||
+        txt.includes('Got an idea to make FreeMCHost better') ||
+        txt.includes('Get Free+ (2GB)') ||
+        txt.includes('Upgrade to Free+')
+      );
+    });
 
-    const closeBtns = allEls.filter(el => 
-      (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') &&
-      (el.innerText.trim() === '✕' || el.innerText.trim() === '×' || el.getAttribute('aria-label') === 'Close')
-    );
-    closeBtns.forEach(btn => btn.click());
-
-    const modalHeaders = allEls.filter(el => 
-      el.textContent && (
-        el.textContent.includes('Got an idea to make FreeMCHost better') ||
-        el.textContent.includes('Upgrade to Free+') ||
-        el.textContent.includes('Get Free+ (2GB)')
-      )
-    );
-    modalHeaders.forEach(header => {
+    noiseHeaders.forEach(header => {
       let container = header;
-      for (let i = 0; i < 6; i++) {
+      for (let i = 0; i < 7; i++) {
         if (container.parentElement && container.parentElement !== document.body) {
+          // 严防误删续期主弹窗
+          if (container.parentElement.innerText && container.parentElement.innerText.includes('Keep your server online')) {
+            break;
+          }
           container = container.parentElement;
         }
       }
@@ -109,7 +102,7 @@ async function forceDismissPopups(page) {
   await page.waitForTimeout(300);
 }
 
-// 真实用户输入
+// 模拟真实用户输入
 async function safeFill(page, locator, value, label) {
   await locator.waitFor({ state: 'visible', timeout: 15000 });
   await locator.click();
@@ -201,6 +194,7 @@ async function safeFill(page, locator, value, label) {
         await page.waitForTimeout(3000);
         await forceDismissPopups(page);
 
+        // 定位并点击 [PLAN Billing] 标签页
         console.log('🗂️ 正在定位并点击 [PLAN Billing] 标签页...');
         const tabCandidates = page.locator('button, a, div[role="tab"]').filter({ hasText: /Billing/i });
         const count = await tabCandidates.count();
@@ -224,7 +218,7 @@ async function safeFill(page, locator, value, label) {
         await page.waitForTimeout(1000);
         await forceDismissPopups(page);
 
-        // 提取倒计时时间
+        // 提取剩余时间
         const timeData = await page.evaluate(() => {
           const allEls = Array.from(document.querySelectorAll('*'));
           const header = allEls.find(el => el.textContent && el.textContent.trim().toUpperCase() === 'TIME UNTIL EXPIRY');
@@ -256,31 +250,66 @@ async function safeFill(page, locator, value, label) {
         if (remainHours < 46) {
           console.log(`🎯 剩余时长 < 46 小时，打开续期弹窗...`);
           await renewBtn.click();
-          await page.waitForTimeout(2000);
+          await page.waitForTimeout(1500);
 
-          // 定位包含 Keep your server online 标题的模态窗口
-          const modalLocator = page.locator('div').filter({ hasText: 'Keep your server online' }).last();
-          await modalLocator.waitFor({ state: 'visible', timeout: 10000 });
+          // 核心破局：点击 Renew now 后立即粉碎叠加的“评分/反馈”弹窗
+          console.log('🛡️ 正在粉碎叠加的评分/反馈弹窗...');
+          await forceDismissPopups(page);
+          await page.waitForTimeout(1000);
 
-          // 定位 60 hours 所在卡片
-          const card60 = modalLocator.locator('div, button').filter({ hasText: '60 hours' }).last();
-          await card60.waitFor({ state: 'visible', timeout: 5000 });
+          // 穿透锁定包含 Keep your server online 的续期弹窗
+          const modalHeader = page.locator('text="Keep your server online"').first();
+          await modalHeader.waitFor({ state: 'visible', timeout: 10000 });
+
+          // 定位 60 hours 选项卡
+          console.log('👉 正在定位并点击 [60 hours] 卡片...');
           
-          console.log('👉 正在执行针对 [60 hours] 选项的物理点击...');
-          await card60.click({ force: true });
+          let cardClicked = false;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            await forceDismissPopups(page);
+            
+            // 点击 60 hours 所在卡片容器
+            cardClicked = await page.evaluate(() => {
+              const allEls = Array.from(document.querySelectorAll('*'));
+              const target = allEls.find(el => 
+                el.children.length === 0 && 
+                el.textContent.trim().toLowerCase().includes('60 hours')
+              );
+              if (!target) return false;
 
-          // 检查是否有后续确认按钮出现并点击
-          const confirmBtn = modalLocator.locator('button:has-text("Confirm"), button:has-text("Renew"), button:has-text("Extend")').first();
+              // 向上找可点击外框
+              let p = target;
+              for (let j = 0; j < 6; j++) {
+                if (p.parentElement && p.parentElement !== document.body) {
+                  p = p.parentElement;
+                  if (p.tagName === 'BUTTON' || p.getAttribute('role') === 'button' || p.onclick || p.classList.toString().includes('cursor-pointer') || p.classList.toString().includes('rounded')) {
+                    p.click();
+                    return true;
+                  }
+                }
+              }
+              target.click();
+              return true;
+            });
+
+            if (cardClicked) {
+              console.log('🎉 已成功触发 [60 hours] 点击！');
+              break;
+            }
+            await page.waitForTimeout(1000);
+          }
+
+          // 检查是否有后续确认按钮
+          const confirmBtn = page.locator('button:has-text("Confirm"), button:has-text("Renew"), button:has-text("Extend")').first();
           if (await confirmBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
             console.log('👉 正在点击弹窗内确认按钮...');
             await confirmBtn.click();
           }
 
-          // 核心等待：等待接口请求完成与弹窗关闭，不再按 Escape
-          console.log('⏳ 等待服务端确认与数据更新...');
+          console.log('⏳ 等待服务端完成续期交互...');
           await page.waitForTimeout(6000);
 
-          // 验证更新后的倒计时
+          // 抓取续期后的新时长进行验证
           const newTimeData = await page.evaluate(() => {
             const allEls = Array.from(document.querySelectorAll('*'));
             const header = allEls.find(el => el.textContent && el.textContent.trim().toUpperCase() === 'TIME UNTIL EXPIRY');
@@ -296,10 +325,10 @@ async function safeFill(page, locator, value, label) {
             return null;
           });
 
-          const newRemainStr = newTimeData ? newTimeData.raw : '未获取到新时间';
+          const newRemainStr = newTimeData ? newTimeData.raw : '已指令下发';
           console.log(`⏱️ 续期后页面剩余时长: ${newRemainStr}`);
 
-          reports.push(`🟢 <b>服务器 ${sIndex}</b>: 续期指令已下发 (前序: ${remainStr} -> 当前: ${newRemainStr})`);
+          reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功续期 60h (前序: ${remainStr} -> 当前: ${newRemainStr})`);
           await page.screenshot({ path: `screenshots/renew-success-server-${sIndex}.png`, fullPage: true });
 
         } else {
