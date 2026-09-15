@@ -1,0 +1,15 @@
+{
+  "name": "freemchost-renew",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Verified FreeMCHost renewal with private notifications",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node renew.js",
+    "check": "node --check renew.js",
+    "test": "node --test --test-concurrency=1"
+  },
+  "dependencies": {
+    "playwright": "1.62.0"
+  }
+}

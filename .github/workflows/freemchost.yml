@@ -2,110 +2,85 @@ name: Freemchost Auto Renew Permanent
 
 on:
   schedule:
-    # 每天执行 2 次（UTC 00:15 和 12:15，即北京时间 08:15 和 20:15）
+    # UTC 00:15 / 12:15，即北京时间每天 08:15 / 20:15
     - cron: '15 0,12 * * *'
   workflow_dispatch:
+    inputs:
+      notify:
+        description: 发送 Telegram 图文通知
+        type: boolean
+        default: true
 
 permissions:
   contents: read
+
+concurrency:
+  group: freemchost-renew
+  cancel-in-progress: false
 
 jobs:
   browser-auto-renew:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      NODE_LINK: ${{ secrets.NODE_LINK }}
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
     steps:
       - name: 拉取代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: 安装 Node.js 环境
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '24'
+          cache: npm
 
-      - name: 安装基础工具与精简依赖
+      - name: 安装固定版本依赖
         run: |
-          npm init -y
-          npm install playwright js-yaml
-          # 核心优化：仅下载 Chromium 引擎，跳过死锁卡顿的多国字体 apt 源
+          npm ci --no-audit --no-fund
           npx playwright install chromium
 
-      - name: ⚙️ 部署 Mihomo 代理内核
-        if: ${{ env.NODE_LINK != '' }}
+      - name: 运行回归检查
         run: |
-          echo "$NODE_LINK" > node.txt
-          python3 -m http.server 8080 &
-          wget -qO sub.tar.gz https://github.com/tindy2013/subconverter/releases/latest/download/subconverter_linux64.tar.gz
-          tar -xf sub.tar.gz
-          nohup ./subconverter/subconverter > sub.log 2>&1 &
-          sleep 2
-          wget -qO mihomo.gz https://github.com/MetaCubeX/mihomo/releases/download/v1.18.2/mihomo-linux-amd64-v1.18.2.gz
-          gunzip mihomo.gz
-          chmod +x mihomo
-          cat << 'EOF' > parse_node.js
-          const fs = require('fs');
-          const http = require('http');
-          const url = require('url');
-          const yaml = require('js-yaml');
-          const nodeLink = (process.env.NODE_LINK || '').trim();
-          async function trySubconverter() {
-            return new Promise((resolve) => {
-              http.get('http://127.0.0.1:25500/sub?target=clash&url=http://127.0.0.1:8080/node.txt&insert=false', (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => resolve(data.includes('proxies:') && data.includes('name:') ? data : null));
-              }).on('error', () => resolve(null));
-            });
-          }
-          function parseRawLink(link) {
-            link = link.trim();
-            if (link.startsWith('socks5://') || link.startsWith('socks://')) {
-              const u = new url.URL(link);
-              return { name: 'node', type: 'socks5', server: u.hostname, port: parseInt(u.port || '1080'), username: u.username || '', password: u.password || '' };
-            }
-            if (link.startsWith('vless://')) {
-              const u = new url.URL(link);
-              const sec = u.searchParams.get('security') || '';
-              const n = { name: 'node', type: 'vless', server: u.hostname, port: parseInt(u.port || '443'), uuid: u.username, tls: ['tls', 'reality'].includes(sec), network: u.searchParams.get('type') || 'tcp' };
-              if (u.searchParams.get('sni')) n.servername = u.searchParams.get('sni');
-              if (sec === 'reality') n['reality-opts'] = { 'public-key': u.searchParams.get('pbk') || '' };
-              return n;
-            }
-            return null;
-          }
-          (async () => {
-            const subRes = await trySubconverter();
-            if (subRes) {
-              fs.writeFileSync('config.yaml', 'socks-port: 7891\nallow-lan: true\nmode: global\n' + subRes);
-            } else {
-              const nodeObj = parseRawLink(nodeLink);
-              fs.writeFileSync('config.yaml', yaml.dump({ 'socks-port': 7891, 'allow-lan': true, 'mode': 'global', 'proxies': [ nodeObj ] }));
-            }
-          })();
-          EOF
-          node parse_node.js
-          nohup ./mihomo -d . -f config.yaml > mihomo.log 2>&1 &
-          sleep 3
-          nc -z 127.0.0.1 7891
+          npm run check
+          npm test
 
-      - name: 执行自动化动态续期
+      - name: 设置可选代理
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          if [ -z "$NODE_LINK" ]; then
+            echo "未配置节点，按 PROXY_URL 或直连设置运行"
+            exit 0
+          fi
+          if ! curl --fail --silent --location --retry 3 \
+            https://main.ssss.nyc.mn/setup_proxy.sh \
+            -o "$RUNNER_TEMP/freemchost_proxy.sh" >/dev/null 2>&1; then
+            echo "::error::代理初始化脚本下载失败"
+            exit 1
+          fi
+          for attempt in 1 2 3; do
+            if python3 scripts/private_run.py --proxy-setup bash "$RUNNER_TEMP/freemchost_proxy.sh"; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "代理初始化失败，5 秒后重试"
+              sleep 5
+            fi
+          done
+          echo "::error::代理初始化失败"
+          exit 1
+
+      - name: 执行自动续期
         env:
           FREE_EMAIL: ${{ secrets.FREE_EMAIL }}
           FREE_PASSWORD: ${{ secrets.FREE_PASSWORD }}
           SERVER_PAGE_URL: ${{ secrets.SERVER_PAGE_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PROXY_URL: ${{ secrets.PROXY_URL != '' && secrets.PROXY_URL || (env.NODE_LINK != '' && 'socks5://127.0.0.1:7891' || '') }}
-        run: node renew.js
+          PROXY_URL: ${{ secrets.PROXY_URL || env.PROXY_SERVER || '' }}
+          SEND_TG: ${{ github.event_name != 'workflow_dispatch' || inputs.notify }}
+        run: python3 scripts/private_run.py node renew.js
 
-      - name: 上传现场截图
+      - name: 清理代理
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Freemchost-Screenshots-${{ github.run_number }}
-          path: screenshots/*.png
-          if-no-files-found: ignore
-          retention-days: 7
+        run: |
+          pkill -x sing-box || true
+          rm -f sing-box sing-box-config.json sing-box.log || true

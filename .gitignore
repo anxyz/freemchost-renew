@@ -1,0 +1,11 @@
+node_modules/
+screenshots/
+__pycache__/
+*.pyc
+*.png
+sing-box
+sing-box*.json
+sing-box*.log
+node.txt
+config.yaml
+*.tar.gz

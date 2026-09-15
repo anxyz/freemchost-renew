@@ -1,347 +1,387 @@
 const { chromium } = require('playwright');
-const fs = require('fs');
 
-if (!fs.existsSync('screenshots')) {
-  fs.mkdirSync('screenshots');
+const ORIGIN = 'https://freemchost.com';
+const HOSTS = new Set(['freemchost.com', 'new.freemchost.com']);
+const RENEW_THRESHOLD_HOURS = 46;
+const NOISE = /How would you rate FreeMCHost|Your feedback|Got an idea to make FreeMCHost better|Get Free\+|Upgrade to Free\+|Join the FreeMCHost community/i;
+const RENEW_DIALOG = /Keep your server online/i;
+const NETWORK_ERROR = /ERR_(?:CONNECTION_RESET|CONNECTION_CLOSED|CONNECTION_TIMED_OUT|TIMED_OUT|SOCKS_CONNECTION_FAILED|PROXY_CONNECTION_FAILED|NETWORK_CHANGED)/;
+
+function log(message) { console.log(message); }
+
+function canonicalServerUrl(value) {
+  const url = new URL(value);
+  if (url.protocol !== 'https:' || !HOSTS.has(url.hostname) || url.username || url.password || (url.port && url.port !== '443')) {
+    throw new Error('服务器地址必须是 FreeMCHost 的 HTTPS 管理页。');
+  }
+  const match = url.pathname.match(/^\/(?:app\/servers|servers?)\/([A-Za-z0-9_-]+)\/?$/);
+  if (!match) throw new Error('服务器管理页应使用 /app/servers/服务器ID 路径。');
+  url.hostname = 'freemchost.com';
+  url.pathname = `/app/servers/${match[1]}`;
+  url.hash = '';
+  return url.href;
 }
 
-// Telegram 通知工具
-async function sendTelegramMessage(botToken, chatId, text) {
-  if (!botToken || !chatId) {
-    console.log('⚠️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过通知。');
-    return;
+function readConfig(env = process.env) {
+  const urls = (env.SERVER_PAGE_URL || '').split(/[\r\n,]+/).map(value => value.trim()).filter(Boolean);
+  const config = {
+    email: (env.FREE_EMAIL || '').trim(), password: env.FREE_PASSWORD || '',
+    serverUrls: [...new Set(urls.map(canonicalServerUrl))],
+    proxyUrl: (env.PROXY_URL || '').trim(), tgToken: (env.TG_BOT_TOKEN || '').trim(),
+    tgChatId: (env.TG_CHAT_ID || '').trim(), notify: (env.SEND_TG || 'true').toLowerCase() === 'true',
+  };
+  if (!config.email || !config.password || !config.serverUrls.length) {
+    throw new Error('请配置 FREE_EMAIL、FREE_PASSWORD 和 SERVER_PAGE_URL。');
   }
-  
-  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        chat_id: chatId, 
-        text: text, 
-        parse_mode: 'HTML',
-        disable_web_page_preview: true 
-      })
-    });
-    
-    const result = await res.json();
-    if (result.ok) {
-      console.log('📢 TG 通知已成功送达！');
-    } else {
-      console.error('⚠️ TG 接口拒收:', result.description);
-      if (result.description && result.description.includes("can't parse entities")) {
-        console.log('🔄 检测到 HTML 实体冲突，正在以纯文本重新补发...');
-        const plainText = text.replace(/<[^>]+>/g, '');
-        const retryRes = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: chatId, text: plainText })
-        });
-        const retryResult = await retryRes.json();
-        if (retryResult.ok) console.log('📢 TG 纯文本通知补发成功！');
-      }
-    }
-  } catch (err) {
-    console.error('❌ TG 网络请求异常:', err.message);
-  }
+  return config;
 }
 
-// 🛡️ 深度清理反馈评分、营销升级、Discord 加入等弹窗
-async function forceDismissPopups(page) {
-  // 1. 关闭 Cookie 栏
-  try {
-    const cookieBtn = page.locator('button:has-text("Accept all"), button:has-text("Reject all")').first();
-    if (await cookieBtn.isVisible({ timeout: 500 })) {
-      await cookieBtn.click();
-    }
-  } catch (e) {}
+function proxyOptions(value) {
+  if (!value) return undefined;
+  const url = new URL(value);
+  if (!['http:', 'https:', 'socks4:', 'socks5:'].includes(url.protocol)) {
+    throw new Error('代理协议不受支持，请使用本地转发地址。');
+  }
+  if (url.protocol.startsWith('socks') && (url.username || url.password)) {
+    throw new Error('带认证的 SOCKS 节点请通过 NODE_LINK 转为本地代理。');
+  }
+  return { server: `${url.protocol}//${url.host}`,
+    ...(url.username ? { username: decodeURIComponent(url.username), password: decodeURIComponent(url.password) } : {}) };
+}
 
-  // 2. 点击可见的 Maybe later
-  for (let i = 0; i < 3; i++) {
+function privateError(error, config) {
+  let text = String(error?.message || error).split('\nCall log:')[0];
+  for (const secret of [config?.email, config?.password, config?.tgToken, config?.tgChatId,
+    config?.proxyUrl, ...(config?.serverUrls || [])].filter(Boolean).sort((a, b) => b.length - a.length)) {
+    text = text.replaceAll(secret, '[REDACTED]');
+  }
+  return text.replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, '[EMAIL]').slice(0, 600);
+}
+
+async function navigate(page, url) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const maybeLater = page.locator('button, a, span, div').filter({ hasText: /^Maybe later$/i }).first();
-      if (await maybeLater.isVisible({ timeout: 800 })) {
-        await maybeLater.click({ force: true });
-        console.log('🛡️ 已点击 [Maybe later] 关闭弹窗');
-        await page.waitForTimeout(400);
+      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      if (response && response.status() >= 500 && attempt < 2) {
+        log('⚠️ 页面连接暂时失败，正在重试');
+        await page.waitForTimeout((attempt + 1) * 1000);
+        continue;
       }
-    } catch (e) {}
+      if (response && response.status() >= 400) {
+        throw new Error(`服务器页面返回 HTTP ${response.status()}，请检查管理页地址或面板状态。`);
+      }
+      return response;
+    } catch (error) {
+      if (attempt === 2 || (!NETWORK_ERROR.test(error.message) && error.name !== 'TimeoutError')) throw error;
+      log('⚠️ 页面连接暂时失败，正在重试');
+      await page.waitForTimeout((attempt + 1) * 1000);
+    }
   }
-
-  // 3. 原生 DOM 精准移除干扰模态框（打分、反馈、免费升级、Discord等）
-  await page.evaluate(() => {
-    const allEls = Array.from(document.querySelectorAll('*'));
-    
-    const noiseHeaders = allEls.filter(el => {
-      const txt = el.textContent || '';
-      return (
-        txt.includes('How would you rate FreeMCHost') ||
-        txt.includes('Your feedback') ||
-        txt.includes('Got an idea to make FreeMCHost better') ||
-        txt.includes('Get Free+ (2GB)') ||
-        txt.includes('Upgrade to Free+') ||
-        txt.includes('Join the FreeMCHost community')
-      );
-    });
-
-    noiseHeaders.forEach(header => {
-      let container = header;
-      for (let i = 0; i < 7; i++) {
-        if (container.parentElement && container.parentElement !== document.body) {
-          if (container.parentElement.innerText && container.parentElement.innerText.includes('Keep your server online')) {
-            break;
-          }
-          container = container.parentElement;
-        }
-      }
-      if (container && container !== document.body) {
-        container.remove();
-      }
-    });
-
-    // 清理遗留的全屏遮罩
-    const backdrops = allEls.filter(el => 
-      el.classList && el.classList.contains('fixed') && el.classList.contains('inset-0') && el.getAttribute('data-state') === 'open'
-    );
-    backdrops.forEach(b => b.remove());
-  });
-
-  await page.waitForTimeout(300);
 }
 
-// 模拟真实用户输入
-async function safeFill(page, locator, value, label) {
-  await locator.waitFor({ state: 'visible', timeout: 15000 });
-  await locator.click();
-  await locator.focus();
+async function firstVisible(locator) {
+  for (const item of await locator.all()) if (await item.isVisible()) return item;
+  return null;
+}
+
+async function dismissOptionalDialogs(page) {
+  const reject = await firstVisible(page.getByRole('button', { name: /^Reject all$/i }));
+  const cookie = reject || await firstVisible(page.getByRole('button', { name: /^Accept all$/i }));
+  if (cookie) await cookie.click({ timeout: 3000 });
+  for (let pass = 0; pass < 3; pass++) {
+    let closed = false;
+    for (const dialog of (await page.getByRole('dialog').all()).reverse()) {
+      if (!await dialog.isVisible()) continue;
+      const text = await dialog.innerText();
+      if (!NOISE.test(text) || RENEW_DIALOG.test(text)) continue;
+      const close = await firstVisible(dialog.getByRole('button', {
+        name: /^(?:Maybe later|Not now|No thanks|Close|Dismiss|Skip)$/i,
+      }));
+      if (close && await close.isEnabled()) {
+        await close.click({ timeout: 3000 });
+        closed = true;
+        break;
+      }
+    }
+    if (!closed) break;
+    await page.waitForTimeout(150);
+  }
+}
+
+async function safeFill(locator, value) {
+  await locator.waitFor({ state: 'visible', timeout: 20000 });
   await locator.fill(value);
-  await page.waitForTimeout(300);
-
-  const actualVal = await locator.inputValue().catch(() => '');
-  if (!actualVal) {
-    console.log(`⚠️ 检测到 ${label} 输入框为空，尝试键盘逐字写入...`);
-    await locator.click();
-    await locator.pressSequentially(value, { delay: 30 });
+  if (await locator.inputValue() !== value) {
+    await locator.clear();
+    await locator.pressSequentially(value, { delay: 20 });
   }
+  if (await locator.inputValue() !== value) throw new Error('登录字段填写未完成。');
 }
 
-// 统一提取页面倒计时工具
+async function login(page, config, timeoutMs = 45000) {
+  log('🚀 正在打开登录页面');
+  await navigate(page, `${ORIGIN}/login`);
+  // Preserve the panel's hydration window before filling its controlled form.
+  await page.waitForTimeout(2000);
+  await dismissOptionalDialogs(page);
+  await safeFill(page.locator('input[type="email"], input[name="email"]').first(), config.email);
+  await safeFill(page.locator('input[type="password"], input[name="password"]').first(), config.password);
+  const submit = page.getByRole('button', { name: /^Sign in$/i }).first();
+  log('🔐 正在登录');
+  await Promise.all([
+    page.waitForURL(url => url.origin === ORIGIN && !/^\/(?:login|signup|forgot-password)(?:\/|$)/.test(url.pathname), { timeout: timeoutMs }),
+    submit.click(),
+  ]);
+  log('✅ 登录成功');
+}
+
+function parseExpiry(text) {
+  if (/^Expired$/i.test(text.trim())) return { totalSeconds: 0, totalHours: 0, raw: '已到期' };
+  const match = text.match(/(\d+)\s*(?:days?|d)\b\s*(\d+)\s*(?:hours?|h)\b\s*(\d+)\s*(?:minutes?|mins?|m)\b(?:\s*(\d+)\s*(?:seconds?|secs?|s)\b)?/i);
+  if (!match) return null;
+  const [days, hours, minutes, seconds] = match.slice(1).map(value => Number(value || 0));
+  if (hours > 23 || minutes > 59 || seconds > 59) return null;
+  const totalSeconds = days * 86400 + hours * 3600 + minutes * 60 + seconds;
+  return { totalSeconds, totalHours: totalSeconds / 3600, raw: `${days}天${hours}小时${minutes}分` };
+}
+
 async function extractExpiryTime(page) {
-  return await page.evaluate(() => {
-    const allEls = Array.from(document.querySelectorAll('*'));
-    const header = allEls.find(el => el.textContent && el.textContent.trim().toUpperCase() === 'TIME UNTIL EXPIRY');
-    if (!header) return null;
-
-    let container = header.parentElement;
-    for (let k = 0; k < 3; k++) {
-      if (container && container.innerText.includes('Renew now')) break;
-      if (container && container.parentElement) container = container.parentElement;
-    }
-
-    if (!container) return null;
-
-    const text = container.innerText;
-    const match = text.match(/(\d{1,2})\s*\n?\s*D[\s\S]*?(\d{1,2})\s*\n?\s*H[\s\S]*?(\d{1,2})\s*\n?\s*M/i);
-    if (match) {
-      const d = parseInt(match[1], 10);
-      const h = parseInt(match[2], 10);
-      const m = parseInt(match[3], 10);
-      return { totalHours: d * 24 + h + m / 60, raw: `${d}天${h}小时${m}分` };
-    }
-    return null;
-  });
+  const label = page.getByText(/^Time until expiry$/i).filter({ visible: true }).first();
+  if (!await label.count()) return null;
+  const scope = label.locator('..');
+  const expired = scope.getByText(/^Expired$/i);
+  if (await expired.count()) return parseExpiry('Expired');
+  const timer = scope.getByRole('timer', { includeHidden: true }).first();
+  if (await timer.count()) {
+    const result = parseExpiry(await timer.getAttribute('aria-label') || await timer.innerText());
+    if (result) return result;
+  }
+  return parseExpiry(await scope.innerText());
 }
 
-(async () => {
-  const email = (process.env.FREE_EMAIL || '').trim();
-  const password = (process.env.FREE_PASSWORD || '').trim();
-  const rawUrls = (process.env.SERVER_PAGE_URL || '').trim();
-  const proxyUrl = (process.env.PROXY_URL || '').trim();
-  const tgToken = (process.env.TG_BOT_TOKEN || '').trim();
-  const tgChatId = (process.env.TG_CHAT_ID || '').trim();
+async function openBilling(page) {
+  await dismissOptionalDialogs(page);
+  const tab = page.getByRole('tab', { name: /Billing/i }).filter({ visible: true }).first();
+  await tab.waitFor({ state: 'visible', timeout: 20000 });
+  await tab.click();
+  await dismissOptionalDialogs(page);
+  await page.getByText(/^Time until expiry$/i).filter({ visible: true }).first()
+    .waitFor({ state: 'visible', timeout: 20000 });
+}
 
-  const serverUrls = rawUrls
-    .split(/[\r\n,]+/)
-    .map(u => u.trim())
-    .filter(u => u.startsWith('http'));
-
-  if (!email || !password || serverUrls.length === 0) {
-    console.error('❌ 缺失账号、密码或有效的 SERVER_PAGE_URL 地址！');
-    process.exit(1);
+async function findFreeOption(dialog) {
+  const candidates = dialog.getByRole('button').filter({ hasText: /Quick top-up|Discord Boosted renewal/i });
+  const matches = [];
+  for (const button of await candidates.all()) {
+    if (!await button.isVisible()) continue;
+    const text = await button.innerText();
+    const hours = text.match(/\b(\d+)\s+hours\b/i);
+    if (!hours || /[$€£¥]\s*\d|\b(?:USD|EUR|GBP)\b/i.test(text)) continue;
+    matches.push({ button, hours: Number(hours[1]), text });
   }
+  if (matches.length > 1) throw new Error('免费续期选项不唯一，已停止提交。');
+  return matches[0] || null;
+}
 
-  console.log(`📋 检测到 ${serverUrls.length} 个独立服务器地址待巡检...`);
+async function waitForRenewal(page, before, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    await dismissOptionalDialogs(page);
+    const current = await extractExpiryTime(page);
+    if (current && current.totalSeconds > before.totalSeconds + 60) return current;
+    await page.waitForTimeout(500);
+  } while (Date.now() < deadline);
+  return null;
+}
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-blink-features=AutomationControlled',
-      '--window-size=1920,1080'
-    ],
-    proxy: proxyUrl ? { server: proxyUrl } : undefined
-  });
+async function renewServer(page, url, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 20000;
+  log('🗂️ 正在打开服务器管理页');
+  await navigate(page, url);
+  const current = new URL(page.url());
+  if (current.origin !== ORIGIN || current.pathname.replace(/\/$/, '') !== new URL(url).pathname) {
+    throw new Error('服务器页面跳转到了其他位置，请检查地址和登录状态。');
+  }
+  const errorHeading = page.getByRole('heading', { name: /^(?:404|Page not found)$/i }).filter({ visible: true });
+  if (await errorHeading.count() && !await page.getByRole('tab', { name: /Billing/i }).count()) {
+    throw new Error('服务器页面不存在（404），请检查管理页地址。');
+  }
+  await openBilling(page);
+  const before = await extractExpiryTime(page);
+  if (!before) throw new Error('无法读取有效的到期倒计时，本次未提交续期。');
+  if (before.totalHours >= RENEW_THRESHOLD_HOURS) {
+    log('⏳ 当前无需续期');
+    return { status: 'not_due', before: before.raw };
+  }
+  log('🔄 正在打开免费续期选项');
+  const renew = page.getByRole('button', { name: /^Renew now$/i }).filter({ visible: true }).first();
+  await renew.click();
+  await dismissOptionalDialogs(page);
+  const dialog = page.getByRole('dialog').filter({ hasText: RENEW_DIALOG }).last();
+  await dialog.waitFor({ state: 'visible', timeout: timeoutMs });
+  let option;
+  const deadline = Date.now() + timeoutMs;
+  do {
+    option = await findFreeOption(dialog);
+    if (option && await option.button.isEnabled()) break;
+    if (option && /Free renewals open .*before expiry/i.test(option.text)) {
+      log('⏳ 面板尚未开放免费续期');
+      return { status: 'not_due', before: before.raw, reason: '面板尚未开放免费续期窗口。' };
+    }
+    await page.waitForTimeout(250);
+  } while (Date.now() < deadline);
+  if (!option || !await option.button.isEnabled()) throw new Error('未找到可用的免费续期选项。');
+  // One click only: a transport error may occur after the mutation was accepted.
+  let clickError;
+  log('🔄 正在提交免费续期');
+  try { await option.button.click(); } catch (error) { clickError = error; }
+  const after = await waitForRenewal(page, before, timeoutMs);
+  if (!after) {
+    log('⚠️ 续期结果未确认');
+    return { status: 'uncertain', before: before.raw,
+      reason: clickError?.message || '已尝试提交，但没有观察到到期时间增加。' };
+  }
+  log('✅ 续期已确认');
+  return { status: 'renewed', before: before.raw, after: after.raw };
+}
 
-  const context = await browser.newContext({
-    viewport: { width: 1920, height: 1080 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    locale: 'en-US'
-  });
+function reportsExitCode(reports) {
+  return reports.length && reports.every(report => ['renewed', 'not_due'].includes(report.status)) ? 0 : 1;
+}
 
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  });
+function buildSummary(reports, env = process.env) {
+  const lines = ['🤖 FreeMCHost 巡检报告', ''];
+  for (const [index, report] of reports.entries()) {
+    const label = report.index ? `服务器 ${report.index}` : `检查 ${index + 1}`;
+    const states = { renewed: '✅ 续期成功', not_due: '⏳ 暂无需续期', uncertain: '⚠️ 续期结果待确认', failed: '❌ 检查失败' };
+    lines.push(`${label}：${states[report.status] || states.failed}`);
+    if (report.before) lines.push(`剩余时间：${report.before}${report.after ? ` → ${report.after}` : ''}`);
+    if (report.reason) lines.push(`详情：${report.reason}`);
+    lines.push('');
+  }
+  lines.push('计划：每天北京时间 08:15、20:15', '规则：剩余不足 46h 且面板允许时执行免费续期。');
+  lines.push(`时间：${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`);
+  if (env.GITHUB_RUN_NUMBER) lines.push(`运行 #${env.GITHUB_RUN_NUMBER} · 第 ${env.GITHUB_RUN_ATTEMPT || '1'} 次尝试`);
+  if (env.GITHUB_REPOSITORY && env.GITHUB_RUN_ID) lines.push(`https://github.com/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}`);
+  return lines.join('\n');
+}
 
-  const page = await context.newPage();
-  let reports = [];
+function limitText(text, length) {
+  if (text.length <= length) return text;
+  return text.slice(0, length - 1).replace(/[\uD800-\uDBFF]$/, '') + '…';
+}
 
+async function captureScreenshot(page) {
   try {
-    console.log('🚀 正在打开 FreeMCHost 登录页...');
-    await page.goto('https://freemchost.com/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(2000);
-    await forceDismissPopups(page);
+    return await page.screenshot({ type: 'png', fullPage: true, timeout: 10000,
+      mask: [page.locator('input, textarea')] });
+  } catch {
+    log('⚠️ 页面截图失败');
+    return null;
+  }
+}
 
-    console.log('📝 正在输入账号密码...');
-    const emailLocator = page.locator('input[type="email"], input[name="email"]').first();
-    const passLocator = page.locator('input[type="password"], input[name="password"]').first();
+async function telegramPost(config, method, fields, photo) {
+  const url = `https://api.telegram.org/bot${config.tgToken}/${method}`;
+  try {
+    let body;
+    let headers;
+    if (photo) {
+      body = new FormData();
+      for (const [name, value] of Object.entries(fields)) body.set(name, value);
+      body.set('photo', new Blob([photo], { type: 'image/png' }), 'freemchost-status.png');
+    } else {
+      headers = { 'Content-Type': 'application/json' };
+      body = JSON.stringify(fields);
+    }
+    const response = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(25000) });
+    const result = await response.json().catch(() => null);
+    if (response.ok && result?.ok === true) return true;
+    log('⚠️ Telegram 接口请求失败');
+  } catch { log('⚠️ Telegram 网络请求失败'); }
+  return false;
+}
 
-    await safeFill(page, emailLocator, email, 'Email');
-    await safeFill(page, passLocator, password, 'Password');
+async function sendReport(config, reports, photo, photoIndex) {
+  if (!config.notify || !config.tgToken || !config.tgChatId) {
+    log('ℹ️ 本次未发送 Telegram 通知');
+    return null;
+  }
+  const text = buildSummary(reports);
+  const caption = photoIndex ? `📸 截图：服务器 ${photoIndex}\n\n${text}` : text;
+  if (photo && await telegramPost(config, 'sendPhoto', { chat_id: config.tgChatId, caption: limitText(caption, 1024) }, photo)) {
+    log('📸 Telegram 截图通知发送成功');
+    return true;
+  }
+  if (photo) log('ℹ️ 图片未发送成功，改发文字通知');
+  const sent = await telegramPost(config, 'sendMessage', { chat_id: config.tgChatId, text: limitText(text, 4096) });
+  log(sent ? '📩 Telegram 文字通知发送成功' : '❌ Telegram 通知发送失败');
+  return sent;
+}
 
-    console.log('🔐 正在触发登录...');
-    const signInBtn = page.locator('button:has-text("Sign in"), button[type="submit"]').first();
-    await Promise.all([
-      page.waitForURL(url => !url.href.includes('/login'), { timeout: 45000 }),
-      signInBtn.click()
-    ]);
-    console.log('✅ 登录成功！');
-
-    for (let i = 0; i < serverUrls.length; i++) {
-      const currentUrl = serverUrls[i];
-      const sIndex = i + 1;
-      console.log(`\n================= 正在巡检服务器 [${sIndex}/${serverUrls.length}] =================`);
-      console.log(`🔗 目标地址: ${currentUrl}`);
-
+async function main(env = process.env, browserType = chromium) {
+  let config = { tgToken: (env.TG_BOT_TOKEN || '').trim(), tgChatId: (env.TG_CHAT_ID || '').trim(), notify: (env.SEND_TG || 'true').toLowerCase() === 'true' };
+  let browser;
+  let page;
+  let photo;
+  let photoIndex;
+  let photoIsFailure = false;
+  const reports = [];
+  let notified = null;
+  log('📋 开始 FreeMCHost 巡检');
+  try {
+    config = readConfig(env);
+    browser = await browserType.launch({ headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled', '--window-size=1920,1080'],
+      proxy: proxyOptions(config.proxyUrl) });
+    const context = await browser.newContext({ viewport: { width: 1920, height: 1080 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', locale: 'en-US' });
+    await context.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
+    page = await context.newPage();
+    await login(page, config);
+    for (const [index, url] of config.serverUrls.entries()) {
+      let report;
       try {
-        await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(3000);
-        await forceDismissPopups(page);
-
-        // 定位并点击 [PLAN Billing] 标签页
-        console.log('🗂️ 正在定位并点击 [PLAN Billing] 标签页...');
-        const tabCandidates = page.locator('button, a, div[role="tab"]').filter({ hasText: /Billing/i });
-        const count = await tabCandidates.count();
-        for (let idx = 0; idx < count; idx++) {
-          const item = tabCandidates.nth(idx);
-          if (await item.isVisible().catch(() => false)) {
-            const txt = await item.innerText().catch(() => '');
-            if (!txt.includes('Total') && (txt.includes('Billing') || txt.includes('PLAN'))) {
-              await item.click({ force: true });
-              console.log(`👉 已点击标签: [${txt.replace(/\n/g, ' ')}]`);
-              break;
-            }
-          }
+        report = await renewServer(page, url);
+        if (report.reason) report.reason = privateError(report.reason, config);
+      } catch (error) {
+        log('❌ 服务器检查失败');
+        report = { status: 'failed', reason: privateError(error, config) };
+      }
+      reports.push({ ...report, index: index + 1 });
+      const failure = ['failed', 'uncertain'].includes(report.status);
+      if (config.notify && config.tgToken && config.tgChatId && (!photoIsFailure || failure)) {
+        const captured = await captureScreenshot(page);
+        if (captured) {
+          photo = captured;
+          photoIndex = index + 1;
+          photoIsFailure = failure;
         }
-
-        await page.waitForTimeout(2500);
-        await forceDismissPopups(page);
-
-        const renewBtn = page.locator('button:has-text("Renew now")').first();
-        await renewBtn.waitFor({ state: 'visible', timeout: 15000 });
-        await page.waitForTimeout(1000);
-        await forceDismissPopups(page);
-
-        // 提取剩余时间
-        const timeData = await extractExpiryTime(page);
-        const remainHours = timeData ? timeData.totalHours : 99;
-        const remainStr = timeData ? timeData.raw : '未读取到';
-        console.log(`⏱️ 服务器 [${sIndex}] 实际剩余时长: ${remainStr} (约 ${remainHours.toFixed(1)} 小时)`);
-
-        if (remainHours < 46) {
-          console.log(`🎯 剩余时长 < 46 小时，打开续期弹窗...`);
-          await renewBtn.click();
-          await page.waitForTimeout(1500);
-
-          // 清理叠加的评分等干扰弹窗
-          await forceDismissPopups(page);
-          await page.waitForTimeout(1000);
-
-          console.log('👉 正在定位并点击 [60 hours] 卡片...');
-          let cardClicked = false;
-          for (let attempt = 0; attempt < 3; attempt++) {
-            await forceDismissPopups(page);
-            cardClicked = await page.evaluate(() => {
-              const allEls = Array.from(document.querySelectorAll('*'));
-              const target = allEls.find(el => 
-                el.children.length === 0 && 
-                el.textContent.trim().toLowerCase().includes('60 hours')
-              );
-              if (!target) return false;
-
-              let p = target;
-              for (let j = 0; j < 6; j++) {
-                if (p.parentElement && p.parentElement !== document.body) {
-                  p = p.parentElement;
-                  if (p.tagName === 'BUTTON' || p.getAttribute('role') === 'button' || p.onclick || p.classList.toString().includes('cursor-pointer') || p.classList.toString().includes('rounded')) {
-                    p.click();
-                    return true;
-                  }
-                }
-              }
-              target.click();
-              return true;
-            });
-
-            if (cardClicked) {
-              console.log('🎉 已成功触发 [60 hours] 选项卡点击！');
-              break;
-            }
-            await page.waitForTimeout(1000);
-          }
-
-          // 点完即生效，等待 4 秒让倒计时完成重绘
-          console.log('⏳ 等待服务端完成续期并刷新数据...');
-          await page.waitForTimeout(4000);
-          // 清除随后可能弹出的 Discord 推广弹窗
-          await forceDismissPopups(page);
-
-          // 抓取续期后的新时长
-          const newTimeData = await extractExpiryTime(page);
-          const newRemainStr = newTimeData ? newTimeData.raw : '已满血加时';
-          console.log(`⏱️ 续期后页面剩余时长: ${newRemainStr}`);
-
-          reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功满血续期 (+60h)\n     └ 状态: ${remainStr} ➔ <b>${newRemainStr}</b>`);
-          await page.screenshot({ path: `screenshots/renew-success-server-${sIndex}.png`, fullPage: true });
-
-        } else {
-          console.log(`⏳ 服务器 [${sIndex}] 距离 46h 开放还差约 ${(remainHours - 46).toFixed(1)} 小时，保持等待。`);
-          reports.push(`⚪ <b>服务器 ${sIndex}</b>: 剩余 ${remainStr} (未达 46h)`);
-        }
-
-      } catch (innerErr) {
-        console.error(`❌ 服务器 [${sIndex}] 处理异常:`, innerErr.message);
-        reports.push(`🔴 <b>服务器 ${sIndex}</b>: 巡检失败 (${innerErr.message.substring(0, 30)})`);
-        try {
-          await page.screenshot({ path: `screenshots/error-server-${sIndex}.png`, fullPage: true });
-        } catch (e) {}
       }
     }
-
-    // 汇总推送 Telegram 报告
-    const summaryMsg = `🤖 <b>FreeMCHost 巡检报告</b>\n\n${reports.join('\n')}\n\n<b>检查周期:</b> 每 12 小时自动巡检\n<b>规则:</b> 触发低于 46h 门槛时自动加满 60h\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`;
-    await sendTelegramMessage(tgToken, tgChatId, summaryMsg);
-
   } catch (error) {
-    console.error('❌ 全局致命错误:', error.message);
-    try {
-      await page.screenshot({ path: 'screenshots/renew_fatal.png', fullPage: true });
-    } catch (e) {}
-    await sendTelegramMessage(tgToken, tgChatId, `🚨 <b>Freemchost 运行崩溃:</b> <code>${error.message}</code>`);
-    process.exitCode = 1;
+    log('❌ 巡检未完成');
+    reports.push({ status: 'failed', reason: privateError(error, config) });
+    if (page && config.notify && config.tgToken && config.tgChatId) photo = await captureScreenshot(page);
   } finally {
-    await browser.close();
-    console.log('🏁 任务完成，浏览器已关闭。');
+    try { notified = await sendReport(config, reports, photo, photoIndex); }
+    catch { log('❌ Telegram 通知发送失败'); notified = false; }
+    if (browser) {
+      try { await browser.close(); } catch { log('⚠️ 浏览器清理未完成'); }
+    }
+    log('🏁 巡检结束');
   }
-})();
+  return notified === false ? 1 : reportsExitCode(reports);
+}
+
+module.exports = { canonicalServerUrl, readConfig, proxyOptions, privateError, navigate,
+  dismissOptionalDialogs, safeFill, login, parseExpiry, extractExpiryTime, openBilling,
+  findFreeOption, waitForRenewal, renewServer, reportsExitCode, buildSummary, limitText,
+  captureScreenshot, telegramPost, sendReport, main };
+
+if (require.main === module) {
+  main().then(code => { process.exitCode = code; }).catch(() => {
+    log('❌ 未处理的运行错误');
+    process.exitCode = 1;
+  });
+}
