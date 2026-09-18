@@ -250,14 +250,14 @@ async function renewServer(page, url, options = {}) {
 }
 
 function reportsExitCode(reports) {
-  return reports.length && reports.every(report => ['renewed', 'not_due', 'pending'].includes(report.status)) ? 0 : 1;
+  return reports.length && !reports.some(report => report.status === 'failed') ? 0 : 1;
 }
 
 function buildSummary(reports, env = process.env) {
   const lines = ['🤖 FreeMCHost 巡检报告', ''];
   for (const [index, report] of reports.entries()) {
     const label = report.index ? `服务器 ${report.index}` : `检查 ${index + 1}`;
-    const states = { renewed: '✅ 续期成功', not_due: '⏳ 暂无需续期', pending: '⏳ 续期待确认', failed: '❌ 续期失败', uncertain: '⚠️ 续期结果待确认' };
+    const states = { renewed: '✅ 续期成功', not_due: '⏳ 暂无需续期', pending: '⏳ 续期待确认', failed: '❌ 续期失败', error: '⚠️ 检查异常', uncertain: '⚠️ 续期结果待确认' };
     lines.push(`${label}：${states[report.status] || states.failed}`);
     if (report.before) lines.push(`剩余时间：${report.before}${report.after ? ` → ${report.after}` : ''}`);
     if (report.reason) lines.push(`详情：${report.reason}`);
@@ -346,10 +346,10 @@ async function main(env = process.env, browserType = chromium) {
         if (report.reason) report.reason = privateError(report.reason, config);
       } catch (error) {
         log('❌ 服务器检查失败');
-        report = { status: 'failed', reason: privateError(error, config) };
+        report = { status: 'error', reason: privateError(error, config) };
       }
       reports.push({ ...report, index: index + 1 });
-      const failure = ['failed', 'uncertain'].includes(report.status);
+      const failure = report.status === 'failed';
       if (config.notify && config.tgToken && config.tgChatId && (!photoIsFailure || failure)) {
         const captured = await captureScreenshot(page);
         if (captured) {
@@ -361,7 +361,7 @@ async function main(env = process.env, browserType = chromium) {
     }
   } catch (error) {
     log('❌ 巡检未完成');
-    reports.push({ status: 'failed', reason: privateError(error, config) });
+    reports.push({ status: 'error', reason: privateError(error, config) });
     if (page && config.notify && config.tgToken && config.tgChatId) photo = await captureScreenshot(page);
   } finally {
     try { notified = await sendReport(config, reports, photo, photoIndex); }

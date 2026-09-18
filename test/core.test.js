@@ -37,11 +37,13 @@ test('expiry supports accessibility labels, visible units and expired state', ()
   assert.equal(app.parseExpiry('Unavailable'), null);
 });
 
-test('any failed or unconfirmed server makes the workflow fail', () => {
+test('only confirmed renewal failures fail the workflow', () => {
   assert.equal(app.reportsExitCode([{ status: 'renewed' }, { status: 'not_due' }]), 0);
   assert.equal(app.reportsExitCode([{ status: 'pending' }]), 0);
+  assert.equal(app.reportsExitCode([{ status: 'error', reason: 'HTTP 404' }]), 0);
+  assert.equal(app.reportsExitCode([{ status: 'renewed' }, { status: 'error' }]), 0);
   assert.equal(app.reportsExitCode([{ status: 'renewed' }, { status: 'failed' }]), 1);
-  assert.equal(app.reportsExitCode([{ status: 'uncertain' }]), 1);
+  assert.equal(app.reportsExitCode([{ status: 'uncertain' }]), 0);
   assert.equal(app.reportsExitCode([]), 1);
 });
 
@@ -140,7 +142,7 @@ test('invalid configuration reports once and never starts a browser', async t =>
   let launches = 0;
   const code = await app.main({ TG_BOT_TOKEN: config.tgToken, TG_CHAT_ID: config.tgChatId },
     { launch: async () => { launches++; } });
-  assert.equal(code, 1);
+  assert.equal(code, 0);
   assert.equal(launches, 0);
   assert.equal(fetch.mock.callCount(), 1);
 });

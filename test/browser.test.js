@@ -139,7 +139,7 @@ describe('browser regressions', () => {
     assert.equal(page.url(), 'https://freemchost.com/app');
   });
 
-  it('a per-server failure makes main fail and sends just one notification', async t => {
+  it('server check errors are reported to Telegram without failing Actions', async t => {
     const calls = [];
     t.mock.method(global, 'fetch', async (url, options) => {
       calls.push({ url, options }); return { ok: true, json: async () => ({ ok: true }) };
@@ -162,9 +162,9 @@ describe('browser regressions', () => {
     }) };
     const code = await app.main({ FREE_EMAIL: 'test@example.invalid', FREE_PASSWORD: 'test-password',
       SERVER_PAGE_URL: SERVER, TG_BOT_TOKEN: '12345:fake-token', TG_CHAT_ID: '1234' }, browserType);
-    assert.equal(code, 1);
+    assert.equal(code, 0);
     assert.equal(calls.length, 1);
     assert.equal(closed, 1);
-    assert.match(calls[0].options.body.get('caption'), /续期失败/);
+    assert.match(calls[0].options.body.get('caption'), /检查异常/);
   });
 });
