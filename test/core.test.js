@@ -44,12 +44,16 @@ test('any failed or unconfirmed server makes the workflow fail', () => {
   assert.equal(app.reportsExitCode([]), 1);
 });
 
-test('renewal summaries do not claim a fixed 60-hour top-up', () => {
-  const result = app.buildSummary([{ status: 'renewed', before: '1小时', after: '48小时', index: 1 }],
-    { GITHUB_RUN_NUMBER: '3', GITHUB_RUN_ATTEMPT: '2', GITHUB_REPOSITORY: 'owner/repo', GITHUB_RUN_ID: '1234' });
-  assert.match(result, /运行 #3 · 第 2 次尝试/);
-  assert.doesNotMatch(result, /\+60h|满血/);
-  assert.match(result, /actions\/runs\/1234/);
+test('renewal summaries contain only server results', () => {
+  const result = app.buildSummary([{ status: 'renewed', before: '1小时', after: '3天6小时', index: 1 }],
+    { GITHUB_RUN_NUMBER: '9', GITHUB_RUN_ATTEMPT: '1', GITHUB_REPOSITORY: 'anxyz/freemchost-renew', GITHUB_RUN_ID: '1234' });
+  assert.match(result, /服务器 1：✅ 续期成功/);
+  assert.match(result, /剩余时间：1小时 → 3天6小时/);
+  assert.ok(!result.includes('计划：'));
+  assert.ok(!result.includes('规则：'));
+  assert.ok(!result.includes('\n时间：'));
+  assert.ok(!result.includes('运行 #'));
+  assert.ok(!result.includes('github.com'));
 });
 
 test('HTTP proxy credentials are separated and SOCKS authentication fails clearly', () => {

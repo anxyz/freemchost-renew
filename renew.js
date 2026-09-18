@@ -258,10 +258,6 @@ function buildSummary(reports, env = process.env) {
     if (report.reason) lines.push(`详情：${report.reason}`);
     lines.push('');
   }
-  lines.push('计划：每天北京时间 08:15、20:15', '规则：剩余不足 46h 且面板允许时执行免费续期。');
-  lines.push(`时间：${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`);
-  if (env.GITHUB_RUN_NUMBER) lines.push(`运行 #${env.GITHUB_RUN_NUMBER} · 第 ${env.GITHUB_RUN_ATTEMPT || '1'} 次尝试`);
-  if (env.GITHUB_REPOSITORY && env.GITHUB_RUN_ID) lines.push(`https://github.com/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}`);
   return lines.join('\n');
 }
 
