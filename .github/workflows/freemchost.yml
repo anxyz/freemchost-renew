@@ -2,7 +2,6 @@ name: Freemchost Auto Renew Permanent
 
 on:
   schedule:
-    # UTC 00:15 / 12:15，即北京时间每天 08:15 / 20:15
     - cron: '15 0,12 * * *'
   workflow_dispatch:
     inputs:

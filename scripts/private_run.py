@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""Only publish known status lines from processes that have access to secrets."""
-
 import argparse
 import os
 import re
@@ -55,7 +52,6 @@ def public_status(line):
 
 
 def export_proxy_environment(source, destination):
-    """Do not expose arbitrary environment values written by the proxy installer."""
     values = {}
     for line in source.read_text(encoding="utf-8", errors="replace").splitlines():
         name, separator, value = line.partition("=")
@@ -77,7 +73,6 @@ def export_proxy_environment(source, destination):
     ):
         raise ValueError("Invalid local proxy configuration")
     hostname = f"[{proxy.hostname}]" if ":" in proxy.hostname else proxy.hostname
-    # The only exported URL consists of a local address and port, without credentials.
     safe_proxy = f"{proxy.scheme}://{hostname}:{proxy.port}"
     with open(destination, "a", encoding="utf-8") as output:
         output.write(f"IS_PROXY=true\nPROXY_SERVER={safe_proxy}\n")
@@ -92,8 +87,6 @@ def run_private(command, proxy_setup=False):
             path.touch(mode=0o600)
             environment[name] = str(path)
         try:
-            # An unnamed temporary file also avoids waiting for pipe EOF from
-            # a background proxy daemon that inherits the installer's stdout.
             with tempfile.TemporaryFile() as output:
                 process = subprocess.run(
                     command,

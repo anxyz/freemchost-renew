@@ -54,7 +54,7 @@ describe('browser regressions', () => {
     assert.equal(await page.locator('html').count(), 1);
   });
 
-  for (const hours of [48, 60, 72]) {
+  for (const hours of [48, 60, 72, 78]) {
     it(`verifies a free ${hours}-hour renewal and never selects a priced card`, async () => {
       await fixture(panel({ hours }));
       const result = await app.renewServer(page, SERVER, { timeoutMs: 1000 });

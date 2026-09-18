@@ -121,7 +121,6 @@ async function safeFill(locator, value) {
 async function login(page, config, timeoutMs = 45000) {
   log('🚀 正在打开登录页面');
   await navigate(page, `${ORIGIN}/login`);
-  // Preserve the panel's hydration window before filling its controlled form.
   await page.waitForTimeout(2000);
   await dismissOptionalDialogs(page);
   await safeFill(page.locator('input[type="email"], input[name="email"]').first(), config.email);
@@ -170,17 +169,18 @@ async function openBilling(page) {
 }
 
 async function findFreeOption(dialog) {
-  const candidates = dialog.getByRole('button').filter({ hasText: /Quick top-up|Discord Boosted renewal/i });
-  const matches = [];
-  for (const button of await candidates.all()) {
-    if (!await button.isVisible()) continue;
-    const text = await button.innerText();
-    const hours = text.match(/\b(\d+)\s+hours\b/i);
-    if (!hours || /[$€£¥]\s*\d|\b(?:USD|EUR|GBP)\b/i.test(text)) continue;
-    matches.push({ button, hours: Number(hours[1]), text });
+  const selectors = ['button', '[role="button"]', '[class*="cursor-pointer"]', '[class*="rounded"]'];
+  for (const selector of selectors) {
+    const candidates = dialog.locator(selector);
+    for (const button of await candidates.all()) {
+      if (!await button.isVisible()) continue;
+      const text = await button.innerText();
+      const hours = text.match(/\b(\d+)\s+hours?\b/i);
+      if (!hours || /[$€£¥]\s*\d|\b(?:USD|EUR|GBP)\b/i.test(text)) continue;
+      return { button, hours: Number(hours[1]), text };
+    }
   }
-  if (matches.length > 1) throw new Error('免费续期选项不唯一，已停止提交。');
-  return matches[0] || null;
+  return null;
 }
 
 async function waitForRenewal(page, before, timeoutMs = 20000) {
@@ -231,7 +231,6 @@ async function renewServer(page, url, options = {}) {
     await page.waitForTimeout(250);
   } while (Date.now() < deadline);
   if (!option || !await option.button.isEnabled()) throw new Error('未找到可用的免费续期选项。');
-  // One click only: a transport error may occur after the mutation was accepted.
   let clickError;
   log('🔄 正在提交免费续期');
   try { await option.button.click(); } catch (error) { clickError = error; }

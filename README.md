@@ -11,7 +11,7 @@
 | `FREE_EMAIL` | 登录邮箱 |
 | `FREE_PASSWORD` | 登录密码，保留原始首尾空格 |
 | `SERVER_PAGE_URL` | 当前管理页，例如 `https://freemchost.com/app/servers/服务器ID`；多个地址用逗号或换行分隔 |
-| `TG_BOT_TOKEN` | 可选，Telegram Bot Token |
+| `TG_BOT_TOKEN`  | ❌可选 | Telegram Bot Token |
 | `TG_CHAT_ID` | 可选，接收通知的聊天 ID |
 | `NODE_LINK` | 可选，代理分享链接，由初始化脚本转为本地代理 |
 | `PROXY_URL` | 可选，浏览器代理地址，优先于 `NODE_LINK` 生成的本地地址 |
