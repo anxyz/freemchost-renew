@@ -65,10 +65,18 @@ describe('browser regressions', () => {
     });
   }
 
-  it('does not claim success if the click does not extend expiry', async () => {
-    await fixture(panel({ update: false }));
+  it('does not fail while expiry remains at least 12 hours and renewal is pending', async () => {
+    await fixture(panel({ remaining: 20, update: false }));
     const result = await app.renewServer(page, SERVER, { timeoutMs: 200 });
-    assert.equal(result.status, 'uncertain');
+    assert.equal(result.status, 'pending');
+    assert.equal(await page.evaluate(() => window.submissions), 1);
+    assert.equal(app.reportsExitCode([result]), 0);
+  });
+
+  it('fails when expiry is below 12 hours and does not increase', async () => {
+    await fixture(panel({ remaining: 11, update: false }));
+    const result = await app.renewServer(page, SERVER, { timeoutMs: 200 });
+    assert.equal(result.status, 'failed');
     assert.equal(await page.evaluate(() => window.submissions), 1);
     assert.equal(app.reportsExitCode([result]), 1);
   });
@@ -157,6 +165,6 @@ describe('browser regressions', () => {
     assert.equal(code, 1);
     assert.equal(calls.length, 1);
     assert.equal(closed, 1);
-    assert.match(calls[0].options.body.get('caption'), /检查失败/);
+    assert.match(calls[0].options.body.get('caption'), /续期失败/);
   });
 });

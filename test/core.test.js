@@ -39,6 +39,7 @@ test('expiry supports accessibility labels, visible units and expired state', ()
 
 test('any failed or unconfirmed server makes the workflow fail', () => {
   assert.equal(app.reportsExitCode([{ status: 'renewed' }, { status: 'not_due' }]), 0);
+  assert.equal(app.reportsExitCode([{ status: 'pending' }]), 0);
   assert.equal(app.reportsExitCode([{ status: 'renewed' }, { status: 'failed' }]), 1);
   assert.equal(app.reportsExitCode([{ status: 'uncertain' }]), 1);
   assert.equal(app.reportsExitCode([]), 1);

@@ -236,23 +236,28 @@ async function renewServer(page, url, options = {}) {
   try { await option.button.click(); } catch (error) { clickError = error; }
   const after = await waitForRenewal(page, before, timeoutMs);
   if (!after) {
-    log('⚠️ 续期结果未确认');
-    return { status: 'uncertain', before: before.raw,
-      reason: clickError?.message || '已尝试提交，但没有观察到到期时间增加。' };
+    if (before.totalHours >= 12) {
+      log('⏳ 续期请求待确认');
+      return { status: 'pending', before: before.raw,
+        reason: clickError?.message || '已提交续期，观察窗口内到期时间尚未增加。' };
+    }
+    log('❌ 续期失败');
+    return { status: 'failed', before: before.raw,
+      reason: clickError?.message || '观察窗口内到期时间未增加，且剩余时间不足 12 小时。' };
   }
   log('✅ 续期已确认');
   return { status: 'renewed', before: before.raw, after: after.raw };
 }
 
 function reportsExitCode(reports) {
-  return reports.length && reports.every(report => ['renewed', 'not_due'].includes(report.status)) ? 0 : 1;
+  return reports.length && reports.every(report => ['renewed', 'not_due', 'pending'].includes(report.status)) ? 0 : 1;
 }
 
 function buildSummary(reports, env = process.env) {
   const lines = ['🤖 FreeMCHost 巡检报告', ''];
   for (const [index, report] of reports.entries()) {
     const label = report.index ? `服务器 ${report.index}` : `检查 ${index + 1}`;
-    const states = { renewed: '✅ 续期成功', not_due: '⏳ 暂无需续期', uncertain: '⚠️ 续期结果待确认', failed: '❌ 检查失败' };
+    const states = { renewed: '✅ 续期成功', not_due: '⏳ 暂无需续期', pending: '⏳ 续期待确认', failed: '❌ 续期失败', uncertain: '⚠️ 续期结果待确认' };
     lines.push(`${label}：${states[report.status] || states.failed}`);
     if (report.before) lines.push(`剩余时间：${report.before}${report.after ? ` → ${report.after}` : ''}`);
     if (report.reason) lines.push(`详情：${report.reason}`);
